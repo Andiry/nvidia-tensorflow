@@ -271,9 +271,9 @@ def train(infer_func, params):
     if not deterministic and not use_dali:
         num_preproc_threads = 10
     elif not deterministic and use_dali:
-        num_preproc_threads = 2 
+        num_preproc_threads = 2
     elif deterministic:
-        num_preproc_threads = 1 
+        num_preproc_threads = 1
 
     training_hooks = [hvd.BroadcastGlobalVariablesHook(0),
                       _PrefillStagingAreasHook()]
@@ -377,9 +377,9 @@ def validate(infer_func, params):
     if not deterministic and not use_dali:
         num_preproc_threads = 10
     elif not deterministic and use_dali:
-        num_preproc_threads = 2 
+        num_preproc_threads = 2
     elif deterministic:
-        num_preproc_threads = 1 
+        num_preproc_threads = 1
 
     if hvd.rank() == 0:
         print("Evaluating")
