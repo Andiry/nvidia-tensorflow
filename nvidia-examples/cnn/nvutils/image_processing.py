@@ -22,8 +22,6 @@ from subprocess import call
 from tensorflow.contrib.data.python.ops import interleave_ops
 from tensorflow.contrib.data.python.ops import batching
 
-from nvidia import dali
-import nvidia.dali.plugin.tf as dali_tf
 
 def _deserialize_image_record(record):
     feature_map = {
@@ -141,161 +139,31 @@ def fake_image_set(batch_size, height, width):
     return ds
 
 
-class HybridPipe(dali.pipeline.Pipeline):
-    def __init__(self,
-                 tfrec_filenames,
-                 tfrec_idx_filenames,
-                 height, width,
-                 batch_size,
-                 num_threads,
-                 device_id,
-                 num_gpus,
-                 deterministic=False):
-
-        kwargs = dict()
-        if deterministic:
-            kwargs['seed'] = 7 * (1 + hvd.rank())
-        super(HybridPipe, self).__init__(batch_size, num_threads, device_id, **kwargs)
-
-        self.input = dali.ops.TFRecordReader(
-            path=tfrec_filenames,
-            index_path=tfrec_idx_filenames,
-            random_shuffle=True,
-            shard_id=device_id,
-            num_shards=num_gpus,
-            initial_fill=10000,
-            features={
-                'image/encoded':dali.tfrecord.FixedLenFeature((), dali.tfrecord.string, ""),
-                'image/class/label':dali.tfrecord.FixedLenFeature([1], dali.tfrecord.int64,  -1),
-                'image/class/text':dali.tfrecord.FixedLenFeature([ ], dali.tfrecord.string, ''),
-                'image/object/bbox/xmin':dali.tfrecord.VarLenFeature(dali.tfrecord.float32, 0.0),
-                'image/object/bbox/ymin':dali.tfrecord.VarLenFeature(dali.tfrecord.float32, 0.0),
-                'image/object/bbox/xmax':dali.tfrecord.VarLenFeature(dali.tfrecord.float32, 0.0),
-                'image/object/bbox/ymax':dali.tfrecord.VarLenFeature(dali.tfrecord.float32, 0.0)})
-        self.decode = dali.ops.nvJPEGDecoder(
-            device="mixed",
-            output_type=dali.types.RGB)
-        self.resize = dali.ops.RandomResizedCrop(
-            device="gpu",
-            size=[height, width],
-            interp_type=dali.types.INTERP_LINEAR,
-            random_aspect_ratio=[0.8, 1.25],
-            random_area=[0.1, 1.0],
-            num_attempts=100)
-        self.normalize = dali.ops.CropMirrorNormalize(
-            device="gpu",
-            output_dtype=dali.types.FLOAT,
-            crop=(height, width),
-            image_type=dali.types.RGB,
-            mean=[121., 115., 100.],
-            std=[70., 68., 71.],
-            output_layout=dali.types.NHWC)
-        self.uniform = dali.ops.Uniform(range=(0.0, 1.0))
-        self.cast_float = dali.ops.Cast(device="gpu", dtype=dali.types.FLOAT)
-        self.mirror = dali.ops.CoinFlip()
-        self.iter = 0
-
-    def define_graph(self):
-        # Read images and labels
-        inputs = self.input(name="Reader")
-        images = inputs["image/encoded"]
-        labels = inputs["image/class/label"].gpu()
-
-        # Decode and augmentation
-        images = self.decode(images)
-        images = self.resize(images)
-        images = self.normalize(images, mirror=self.mirror())
-
-        return (images, labels)
-
-    def iter_setup(self):
-        pass
-
-class DaliPreprocessor(object):
-    def __init__(self,
-                 filenames,
-                 idx_filenames,
-                 height, width,
-                 batch_size,
-                 num_threads,
-                 dtype=tf.uint8,
-                 deterministic=False):
-        pipe = HybridPipe(
-            tfrec_filenames=filenames,
-            tfrec_idx_filenames=idx_filenames,
-            height=height,
-            width=width,
-            batch_size=batch_size,
-            num_threads=num_threads,
-            device_id=hvd.rank(),
-            num_gpus=hvd.size(),
-            deterministic=deterministic)
-        serialized_pipe = pipe.serialize()
-        del pipe
-
-        daliop = dali_tf.DALIIterator()
-
-        with tf.device("/gpu:0"):
-            self.images, self.labels = daliop(
-                serialized_pipeline=serialized_pipe,
-                shape=[batch_size, height, width, 3],
-                device_id=hvd.rank())
-
-    def get_device_minibatches(self):
-        with tf.device("/gpu:0"):
-            self.labels -= 1 # Change to 0-based (don't use background class)
-        return self.images, self.labels
-
 def image_set(filenames, batch_size, height, width, training=False,
               distort_color=False, num_threads=10, nsummary=10,
               deterministic=False, use_dali=False, idx_filenames=None):
-    if use_dali:
-        if idx_filenames is None:
-            raise ValueError("Must provide idx_filenames if Dali is enabled")
-        # shuffle files
-        # disabled for now because we don't know yet if this fixes problems.
-        # We have set the same numpy random seed for all processes,
-        # otherwise different processes will have different permutation of
-        # the dataset which will be sharded and thus causing different devices
-        # possibly seeing the same images.
-        #files = list(zip(filenames, idx_filenames))
-        #np.random.shuffle(files)
-        #filenames, idx_filenames = zip(*files)
-        #filenames = list(filenames)
-        #idx_filenames = list(idx_filenames)
-
-        preprocessor = DaliPreprocessor(
-            filenames,
-            idx_filenames,
-            height, width,
-            batch_size,
-            num_threads,
-            deterministic=deterministic)
-        images, labels = preprocessor.get_device_minibatches()
-        return (images, labels)
-    else:
-        shuffle_buffer_size = 10000
-        num_readers = 1
-        ds = tf.data.Dataset.from_tensor_slices(filenames)
-        if training:
-            ds = ds.shard(hvd.size(), hvd.rank())
-            ds = ds.repeat()
-            ds = ds.shuffle(shuffle_buffer_size,
-                     seed=5 * (1 + hvd.rank()) if deterministic else None)
-        ds = ds.interleave(
-            tf.data.TFRecordDataset, cycle_length=num_readers, block_length=1)
-        counter = tf.data.Dataset.range(sys.maxsize)
-        ds = tf.data.Dataset.zip((ds, counter))
-        preproc_func = lambda record, counter_: _parse_and_preprocess_image_record(
-            record, counter_, height, width, deterministic=deterministic,
-            random_crop=training, distort_color=distort_color,
-            nsummary=nsummary if training else 0)
-        ds = ds.map(preproc_func, num_parallel_calls=num_threads)
-        if training:
-            ds = ds.shuffle(shuffle_buffer_size,
-                     seed=13 * (1 + hvd.rank()) if deterministic else None)
-        ds = ds.batch(batch_size)
-        return ds
+    shuffle_buffer_size = 10000
+    num_readers = 1
+    ds = tf.data.Dataset.from_tensor_slices(filenames)
+    if training:
+        ds = ds.shard(hvd.size(), hvd.rank())
+        ds = ds.repeat()
+        ds = ds.shuffle(shuffle_buffer_size,
+                 seed=5 * (1 + hvd.rank()) if deterministic else None)
+    ds = ds.interleave(
+        tf.data.TFRecordDataset, cycle_length=num_readers, block_length=1)
+    counter = tf.data.Dataset.range(sys.maxsize)
+    ds = tf.data.Dataset.zip((ds, counter))
+    preproc_func = lambda record, counter_: _parse_and_preprocess_image_record(
+        record, counter_, height, width, deterministic=deterministic,
+        random_crop=training, distort_color=distort_color,
+        nsummary=nsummary if training else 0)
+    ds = ds.map(preproc_func, num_parallel_calls=num_threads)
+    if training:
+        ds = ds.shuffle(shuffle_buffer_size,
+                 seed=13 * (1 + hvd.rank()) if deterministic else None)
+    ds = ds.batch(batch_size)
+    return ds
 
 def image_set_new(filenames, batch_size, height, width,
                   training=False, distort_color=False,
